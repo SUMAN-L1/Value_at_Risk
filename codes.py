@@ -1,9 +1,10 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
+import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import seaborn as sns
-import statsmodels.api as sm
 from scipy.stats import norm, chi2
 from jinja2 import Template
 import warnings
@@ -11,181 +12,772 @@ import warnings
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-# ===================== Page Configuration =====================
-st.set_page_config(page_title="RAISE_X | Market Risk Analysis", layout="wide")
+# Try import plotly for interactive charts
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except Exception:
+    PLOTLY_AVAILABLE = False
 
-st.markdown("""
+# ===================== Page config =====================
+st.set_page_config(
+    page_title="Market Risk Analysis for Farmers",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better UI
+st.markdown(
+    """
 <style>
-    .main-header { text-align: center; color: #2E8B57; font-size: 2.2rem; font-weight: bold; }
-    .report-box { background-color: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 5px solid #2E8B57; margin-bottom: 20px; }
-    .stMetric { background-color: #ffffff; padding: 10px; border-radius: 8px; box-shadow: 1px 1px 3px rgba(0,0,0,0.1); }
+    .main-header { text-align: center; color: #2E8B57; font-size: 2rem; font-weight: bold; margin-bottom: 1rem; }
+    .sub-header { color: #4682B4; font-size: 1.5rem; font-weight: bold; margin: 1rem 0; }
+    .info-box { background-color: #f0f8ff; padding: 1rem; border-radius: 10px; border-left: 5px solid #4682B4; margin: 1rem 0; }
+    .warning-box { background-color: #fff3cd; padding: 1rem; border-radius: 10px; border-left: 5px solid #ffc107; margin: 1rem 0; }
+    .success-box { background-color: #d4edda; padding: 1rem; border-radius: 10px; border-left: 5px solid #28a745; margin: 1rem 0; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ===================== Core Math Functions =====================
-def to_pct(log_val):
-    return (np.exp(log_val) - 1) * 100
+# Header
+st.markdown('<h1 class="main-header">RAISE_X (Real-time Insights on Scenario Evaluation)</h1>', unsafe_allow_html=True)
+st.markdown('<h2 class="main-header">🍅 Market Risk Analysis for Farmers</h2>', unsafe_allow_html=True)
+st.markdown('<h3 style="text-align: center; color: #666;">Predict Market Risks & Plan Better</h3>', unsafe_allow_html=True)
 
-def kupiec_test(breaches, total, p_expected):
-    if total == 0 or breaches == 0: return 0, 1.0
-    p_obs = breaches / total
-    # Likelihood Ratio for Proportion of Failures
-    num = ((1 - p_expected)**(total - breaches)) * (p_expected**breaches)
-    den = ((1 - p_obs)**(total - breaches)) * (p_obs**breaches)
-    if den == 0: den = 1e-10
-    lr = -2 * np.log(num / den)
-    p_value = 1 - chi2.cdf(lr, df=1)
-    return lr, p_value
+# Instructions
+with st.expander("📋 How to Use This App (Click to Read)", expanded=False):
+    st.markdown(
+        """
+### Simple Steps:
+1. **Upload your market data** (Excel or CSV file with dates and prices)
+2. **Choose your settings** on the left panel (confidence level, simulations)
+3. **Select date range** and price column to analyze
+4. **View results** - see risk predictions and policy recommendations
 
-# ===================== Sidebar =====================
-with st.sidebar:
-    st.title("⚙️ Analysis Control")
-    conf_level = st.slider("Confidence Interval (%)", 90, 99, 95) / 100.0
-    num_sims = st.number_input("Simulations", 1000, 50000, 10000)
-    window = st.number_input("Rolling Window (Weeks)", 20, 104, 52)
-    
-    st.divider()
-    st.markdown("### Data Pre-processing")
-    treat_outliers = st.toggle("Remove Price Outliers (IQR Method)", value=True)
-    
-    st.info("RAISE_X: Real-time Insights on Scenario Evaluation")
+### What You Need:
+- File with dates and market prices
+- For advanced analysis: columns named 'Modal' (prices) and 'Arrivals' (quantity)
 
-# ===================== App Header =====================
-st.markdown('<h1 class="main-header">RAISE_X: Market Risk & Scenario Evaluation</h1>', unsafe_allow_html=True)
+### What You Get:
+- Risk predictions for your market (Historical VaR, Parametric VaR, Monte Carlo VaR & CVaR)
+- Policy recommendations to reduce losses
+- Future risk forecasts to plan ahead
+"""
+    )
 
-# ===================== File Loading & Cleaning =====================
-uploaded_file = st.file_uploader("Upload Market Data (CSV, XLSX, XLS)", type=["csv", "xlsx", "xls"])
+# ===================== Sidebar Controls =====================
+st.sidebar.markdown('<h2 style="color: #2E8B57;">⚙️ Settings</h2>', unsafe_allow_html=True)
+
+# Confidence level as integer percent (clear UX)
+st.sidebar.markdown("**📊 Confidence Level (VaR)**")
+conf_percent = st.sidebar.slider(
+    "Choose confidence level (percent)",
+    min_value=90,
+    max_value=99,
+    value=95,
+    step=1,
+    help="95 means you're 95% sure losses won't exceed the predicted amount",
+)
+confidence_level = conf_percent / 100.0
+z_score = norm.ppf(1 - confidence_level)
+
+# Monte Carlo simulations
+st.sidebar.markdown("**🎲 Number of Simulations**")
+num_simulations = st.sidebar.number_input(
+    "More simulations = more accurate (but slower)",
+    min_value=1000,
+    max_value=100000,
+    value=10000,
+    step=1000,
+    help="Default 10,000 is good for most cases",
+)
+
+# Rolling window for backtesting
+st.sidebar.markdown("**📅 Analysis Window (weeks)**")
+rolling_window = st.sidebar.number_input(
+    "Weeks of data to use for each prediction",
+    min_value=10,
+    max_value=520,
+    value=52,
+    step=1,
+    help="52 weeks = 1 year of data for each prediction",
+)
+
+# Forecast horizon
+st.sidebar.markdown("**🔮 Forecast Horizon (weeks)**")
+forecast_horizon = st.sidebar.number_input(
+    "How many weeks ahead to predict",
+    min_value=4,
+    max_value=104,
+    value=26,
+    step=1,
+    help="26 weeks = 6 months ahead prediction",
+)
+
+# Options
+st.sidebar.markdown("---")
+st.sidebar.markdown("**📈 Display Options**")
+run_forecast = st.sidebar.checkbox("Show future risk forecast", value=True)
+interactive_plots = st.sidebar.checkbox("Use interactive charts (plotly)", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("💡 **Tip:** Start with default settings, then adjust as needed")
+
+# ===================== File upload =====================
+st.markdown('<h2 class="sub-header">📁 Upload Your Market Data</h2>', unsafe_allow_html=True)
+
+uploaded_file = st.file_uploader("Choose your file (CSV, Excel)", type=["csv", "xls", "xlsx"], help="File should contain dates and market prices")
+
+if not PLOTLY_AVAILABLE and interactive_plots:
+    st.markdown(
+        """
+    <div class="warning-box">
+        <strong>⚠️ Note:</strong> Interactive charts not available. Install plotly for better visualizations.
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+def read_file(uploaded):
+    if uploaded.name.endswith(".csv"):
+        return pd.read_csv(uploaded)
+    else:
+        return pd.read_excel(uploaded)
+
+def prepare_index_dates(df):
+    # try common date column names
+    for c in ["Date", "date", "DATE"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+            df = df.dropna(subset=[c]).set_index(c).sort_index()
+            return df
+    # if index looks like dates already
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception:
+        pass
+    return df
 
 if uploaded_file:
     try:
-        # Load
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        
-        # Date Handling
-        date_col = next((c for c in df.columns if 'date' in c.lower()), None)
-        if date_col:
-            df[date_col] = pd.to_datetime(df[date_col])
-            df.set_index(date_col, inplace=True)
-            df.sort_index(inplace=True)
-        
-        # Column Selection
-        cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        p_col = st.selectbox("Market Price (Modal)", cols, index=cols.index('Modal') if 'Modal' in cols else 0)
-        a_col = st.selectbox("Arrivals (Optional)", ["None"] + cols, index=cols.index('Arrivals')+1 if 'Arrivals' in cols else 0)
+        df = read_file(uploaded_file)
+        df = prepare_index_dates(df)
 
-        # Cleaning Logic
-        working_df = df[[p_col]].copy()
-        if a_col != "None": working_df[a_col] = df[a_col]
-        
-        # Outlier Treatment
-        if treat_outliers:
-            Q1 = working_df[p_col].quantile(0.25)
-            Q3 = working_df[p_col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            working_df = working_df[(working_df[p_col] >= lower_bound) & (working_df[p_col] <= upper_bound)]
-            st.caption(f"Outlier treatment removed {len(df) - len(working_df)} extreme weeks.")
+        st.markdown(
+            f"""
+        <div class="success-box">
+            <strong>✅ Data loaded successfully!</strong><br>
+            📅 <strong>Date Range:</strong> {df.index.min().date() if not df.empty else 'N/A'} to {df.index.max().date() if not df.empty else 'N/A'}<br>
+            📊 <strong>Total Records:</strong> {len(df)}
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
 
-        # Returns
-        working_df['Log_Returns'] = np.log(working_df[p_col] / working_df[p_col].shift(1))
-        if a_col != "None":
-            working_df['Log_Arrivals'] = np.log(working_df[a_col].replace(0, np.nan)).fillna(method='bfill')
-        working_df.dropna(inplace=True)
+        # numeric columns
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        if not numeric_cols:
+            st.error("❌ No numeric price columns found in your data!")
+            st.stop()
 
-        # ===================== Tabs =====================
-        t1, t2, t3 = st.tabs(["📊 Static Analysis", "🧪 Backtesting (Kupiec)", "🔮 Forecasting"])
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            selected_col = st.selectbox("🎯 Select Market Price Column", options=["All Columns"] + numeric_cols, help="Choose which price to analyze for risk")
+        with col2:
+            # date range picker
+            default_start = df.index.min().date()
+            default_end = df.index.max().date()
+            date_range = st.date_input("📅 Select Date Range", [default_start, default_end])
 
-        with t1:
-            st.subheader("Scientifically Valid Risk Metrics")
-            mu, sigma = working_df['Log_Returns'].mean(), working_df['Log_Returns'].std()
-            z_score = norm.ppf(1 - conf_level)
+        # filter by date range
+        if len(date_range) == 2:
+            start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+            df = df.loc[(df.index >= start) & (df.index <= end)]
 
-            # Calculations
-            h_var = np.percentile(working_df['Log_Returns'], (1 - conf_level) * 100)
-            p_var = mu + z_score * sigma
-            
-            if a_col != "None":
-                X = sm.add_constant(working_df['Log_Arrivals'])
-                res = sm.OLS(working_df['Log_Returns'], X).fit()
-                sim_arr = np.random.normal(working_df['Log_Arrivals'].mean(), working_df['Log_Arrivals'].std(), num_sims)
-                sim_mu = res.params[0] + res.params[1] * sim_arr
-                sim_ret = np.random.normal(sim_mu, res.resid.std(), num_sims)
+        analysis_cols = numeric_cols if selected_col == "All Columns" else [selected_col]
+        results = []
+        briefs = []
+
+        st.markdown('<h2 class="sub-header">📊 Risk Analysis Results</h2>', unsafe_allow_html=True)
+
+        for col in analysis_cols:
+            series = df[col].copy()
+            series.replace(0, np.nan, inplace=True)
+            series = series.dropna()
+            if len(series) < 30:
+                st.warning(f"⚠️ Not enough data for {col}. Need at least 30 data points.")
+                continue
+
+            # log returns
+            log_returns = np.log(series / series.shift(1)).dropna()
+            mu, sigma = log_returns.mean(), log_returns.std()
+
+            # Historical VaR: empirical quantile of returns
+            hist_var = np.percentile(log_returns, (1 - confidence_level) * 100)
+
+            # Parametric VaR: assume normal with mu, sigma
+            param_var = mu + z_score * sigma
+
+            # Monte Carlo simulations and CVaR
+            np.random.seed(42)
+            sim_returns = np.random.normal(mu, sigma, size=int(num_simulations))
+            mc_var = np.percentile(sim_returns, (1 - confidence_level) * 100)
+            mc_cvar = sim_returns[sim_returns <= mc_var].mean()
+
+            # convert to percent (weekly loss % approx)
+            def to_pct(x):
+                return (np.exp(x) - 1) * 100
+
+            results.append(
+                {
+                    "Market": col,
+                    "Historical VaR (%)": round(to_pct(hist_var), 3),
+                    "Parametric VaR (%)": round(to_pct(param_var), 3),
+                    "Conditional VaR (%)": round(to_pct(mc_var), 3),
+                    "Conditional VaR (%)": round(to_pct(mc_cvar), 3),
+                }
+            )
+
+            # Policy brief (simple)
+            risk_level = "HIGH" if abs(mc_cvar) > 0.1 else "MODERATE" if abs(mc_cvar) > 0.05 else "LOW"
+            brief_template = Template(
+                """
+### 🎯 Market: {{ market }}
+
+**📈 Risk Summary ({{ conf_level }}% Confidence):**
+- **Historical Risk:** {{ hist }}% weekly loss
+- **Parametric Model Risk:** {{ param }}% weekly loss
+- **Montecarlo Risk (VaR):** {{ mc }}% weekly loss
+- **Conditional VaR Risk (CVaR):** {{ cvar }}% weekly loss
+
+**🚨 Risk Level: {{ risk_level }}**
+
+**💡 What This Means:**
+{% if risk_level == "HIGH" %}
+- **High Risk Market:** Expect significant price swings
+- **Action Needed:** Consider reducing inventory or hedging
+{% elif risk_level == "MODERATE" %}
+- **Moderate Risk:** Some price volatility expected
+- **Manageable Risk:** Standard precautions recommended
+{% else %}
+- **Low Risk Market:** Relatively stable prices
+- **Good News:** Lower chance of major losses
+{% endif %}
+
+**🛡️Recommended Actions:**
+
+**Farmers**
+1. Stagger Planting – Adjust sowing windows to avoid synchronized harvests and market gluts  
+2. FPO-Led Direct Marketing – Leverage collective sales to institutional buyers for better price realization  
+3. Farm-Gate Value Addition – Process surplus into storable products to stabilize income during price crashes  
+4. Plan early for alternate crops to secure better prices and income
+5. Always have emergency funds to cultivate one crop atleast 
+
+**Policy makers**
+1. Price Stabilization Fund – Deploy targeted procurement/interventions during glut periods  
+2. Processing & Value Addition Incentives – Support decentralized tomato processing units to absorb surplus  
+3. Market Intelligence Systems – Strengthen real-time price forecasting and advisory dissemination to farmers  
+"""
+            )
+            buffer_days = 15 if risk_level == "HIGH" else 10 if risk_level == "MODERATE" else 7
+            contract_pct = 40 if risk_level == "HIGH" else 25 if risk_level == "MODERATE" else 15
+            emergency_fund = 15 if risk_level == "HIGH" else 10 if risk_level == "MODERATE" else 5
+
+            brief = brief_template.render(
+                market=col,
+                conf_level=int(confidence_level * 100),
+                hist=round(to_pct(hist_var), 2),
+                param=round(to_pct(param_var), 2),
+                mc=round(to_pct(mc_var), 2),
+                cvar=round(to_pct(mc_cvar), 2),
+                risk_level=risk_level,
+                buffer_days=buffer_days,
+                contract_pct=contract_pct,
+                emergency_fund=emergency_fund,
+            )
+            briefs.append((col, brief))
+
+            # ====== Plot: combined view (Historical distribution + parametric + MC VaR + CVaR) ======
+            if interactive_plots and PLOTLY_AVAILABLE:
+                fig = go.Figure()
+
+                # Histogram of historical log-returns
+                fig.add_trace(
+                    go.Histogram(
+                        x=log_returns,
+                        nbinsx=50,
+                        name="Historical (Empirical)",
+                        opacity=0.6,
+                    )
+                )
+
+                # Parametric normal density (scaled) as a line with method legend label
+                xs = np.linspace(log_returns.min(), log_returns.max(), 200)
+                pdf_vals = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
+                # scale pdf to histogram height approximately
+                scale_factor = len(log_returns) * (log_returns.max() - log_returns.min()) / 50
+                fig.add_trace(go.Scatter(x=xs, y=pdf_vals * scale_factor, mode="lines", name="Parametric (Normal)"))
+
+                # Vertical lines for VaRs & CVaR with meaningful legend names
+                fig.add_vline(x=hist_var, line=dict(color="black", dash="dash"))
+                fig.add_vline(x=param_var, line=dict(color="green", dash="dash"))
+                fig.add_vline(x=mc_var, line=dict(color="red", dash="dash"))
+                fig.add_vline(x=mc_cvar, line=dict(color="purple", dash="dash"), annotation_text=f"Conditional CVaR {to_pct(mc_cvar):.2f}%", annotation_position="top left")
+                              
+                # To show methods in legend explicitly, add invisible scatter traces with method names (helps legend clarity)
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="black"), name="Historical VaR"))
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="green"), name="Parametric VaR"))
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="red"), name="Monte Carlo VaR"))
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="purple"), name="Conditional VaR"))
+
+                fig.update_layout(
+                    title=f"Risk Distribution & Methods - {col}",
+                    xaxis_title="Log Returns",
+                    yaxis_title="Frequency / scaled density",
+                    bargap=0.1,
+                    height=450,
+                    showlegend=True,
+                )
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                sim_ret = np.random.normal(mu, sigma, num_sims)
-            
-            mc_var = np.percentile(sim_ret, (1 - conf_level) * 100)
-            cvar = sim_ret[sim_ret <= mc_var].mean()
+                # Matplotlib fallback: label methods clearly in legend
+                fig, ax = plt.subplots(figsize=(10, 4))
+                sns.histplot(log_returns, bins=50, kde=False, ax=ax)
+                xs = np.linspace(log_returns.min(), log_returns.max(), 200)
+                pdf_vals = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
+                scale_factor = len(log_returns) * (log_returns.max() - log_returns.min()) / 50
+                ax.plot(xs, pdf_vals * scale_factor, linestyle="--", label="Parametric (Normal)")
+                # VaR lines
+                ax.axvline(hist_var, color="black", linestyle="--", label=f"Historical VaR {to_pct(hist_var):.2f}%")
+                ax.axvline(param_var, color="green", linestyle="--", label=f"Parametric VaR {to_pct(param_var):.2f}%")
+                ax.axvline(mc_var, color="red", linestyle="--", label=f"Monte Carlo VaR {to_pct(mc_var):.2f}%")
+                ax.axvline(mc_cvar, color="purple", linestyle="--", label=f"Conditional VaR {to_pct(mc_cvar):.2f}%")
+                ax.set_title(f"Risk Distribution & Methods - {col}")
+                ax.set_xlabel("Log Returns")
+                ax.legend()
+                st.pyplot(fig)
 
-            # Display
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Historical VaR", f"{to_pct(h_var):.2f}%")
-            m2.metric("Parametric VaR", f"{to_pct(p_var):.2f}%")
-            m3.metric("Monte Carlo VaR", f"{to_pct(mc_var):.2f}%")
-            m4.metric("Exp. Shortfall (CVaR)", f"{to_pct(cvar):.2f}%")
+        # Display results table
+        if results:
+            st.markdown("### 📋 Risk Comparison Table")
+            results_df = pd.DataFrame(results).set_index("Market")
+            st.dataframe(results_df, use_container_width=True)
 
-            # Table
-            st.table(pd.DataFrame({
-                "Method": ["Historical", "Parametric", "Monte Carlo", "Expected Shortfall (CVaR)"],
-                "1-Week Potential Loss (%)": [to_pct(h_var), to_pct(p_var), to_pct(mc_var), to_pct(cvar)]
-            }).round(3))
+        # Display policy briefs
+        if briefs:
+            st.markdown("### 📝 Detailed Risk Analysis & Recommendations")
+            for market, brief in briefs:
+                with st.expander(f"📊 Analysis for {market} - Click to View Details"):
+                    st.markdown(brief)
 
-        with t2:
-            st.subheader("Model Validation")
-            if len(working_df) > window:
-                bt_list = []
-                for i in range(window, len(working_df)):
-                    train = working_df.iloc[i-window:i]
-                    act = working_df['Log_Returns'].iloc[i]
-                    # Sim for rolling VaR
-                    if a_col != "None":
-                        m_bt = sm.OLS(train['Log_Returns'], sm.add_constant(train['Log_Arrivals'])).fit()
-                        s_r = np.random.normal(m_bt.params[0] + m_bt.params[1] * train['Log_Arrivals'].mean(), m_bt.resid.std(), 1000)
-                    else:
-                        s_r = np.random.normal(train['Log_Returns'].mean(), train['Log_Returns'].std(), 1000)
+        # ===================== Advanced Analysis (requires Modal & Arrivals) =====================
+        if "Modal" in df.columns and "Arrivals" in df.columns:
+            st.markdown('<h2 class="sub-header">🔍 Advanced Risk Testing</h2>', unsafe_allow_html=True)
+
+            ds = df[["Modal", "Arrivals"]].copy()
+            ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
+            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).fillna(method="bfill")
+            ds = ds.dropna()
+
+            if len(ds) > rolling_window:
+                np.random.seed(42)
+                backtest_results = []
+                for i in range(int(rolling_window), len(ds)):
+                    train = ds.iloc[i - int(rolling_window) : i]
+                    test = ds.iloc[i]
+
+                    X = sm.add_constant(train["Log_Arrivals"])
+                    y = train["Log_Returns"]
+                    model = sm.OLS(y, X).fit()
+
+                    # simulate arrivals and returns
+                    sim_arr = np.random.normal(train["Log_Arrivals"].mean(), train["Log_Arrivals"].std(), int(num_simulations))
+                    sim_mu = model.params[0] + model.params[1] * sim_arr
+                    sim_ret = np.random.normal(sim_mu, model.resid.std(), size=int(num_simulations))
+
+                    mc_var_bt = np.percentile(sim_ret, (1 - confidence_level) * 100)
+                    mc_cvar_bt = sim_ret[sim_ret <= mc_var_bt].mean()
+
+                    actual_ret = test["Log_Returns"]
+                    backtest_results.append(
+                        {
+                            "Date": ds.index[i],
+                            "Actual_Return": actual_ret,
+                            "MC_VaR": mc_var_bt,
+                            "MC_CVaR": mc_cvar_bt,
+                            "Breach_VaR": actual_ret < mc_var_bt,
+                            "Breach_CVaR": actual_ret < mc_cvar_bt,
+                        }
+                    )
+
+                bt_df = pd.DataFrame(backtest_results).set_index("Date")
+
+                # -------------------------
+                # Kupiec (Unconditional Coverage) test for VaR breaches
+                # x = observed failures, n = sample size, p = expected failure prob = 1 - confidence_level
+                # LR_uc = -2 * ( log((1-p)^(n-x) p^x) - log((1-p_hat)^(n-x) p_hat^x) )
+                # p-value = 1 - chi2.cdf(LR_uc, df=1)
+                # -------------------------
+                n = len(bt_df)
+                x = bt_df["Breach_VaR"].sum()
+                p = 1 - confidence_level
+                p_hat = x / n if n > 0 else 0.0
+
+                # Guard against zero/one probabilities
+                def safe_log(x):
+                    return np.log(x) if x > 0 else -1e10
+
+                if n > 0:
+                    # Log-likelihood under H0 (p)
+                    ll0 = (n - x) * safe_log(1 - p) + x * safe_log(p)
+                    # Log-likelihood under H1 (p_hat)
+                    # If p_hat is 0 or 1, adjust slightly to avoid -inf
+                    ph = min(max(p_hat, 1e-10), 1 - 1e-10)
+                    ll1 = (n - x) * safe_log(1 - ph) + x * safe_log(ph)
+
+                    LR_uc = -2 * (ll0 - ll1)
+                    kupiec_pvalue = 1 - chi2.cdf(LR_uc, df=1)
+                else:
+                    LR_uc = np.nan
+                    kupiec_pvalue = np.nan
+
+                # Interactive CVaR / Monte Carlo backtest plot with breaches highlighted
+                if interactive_plots and PLOTLY_AVAILABLE:
+                    st.markdown("### 📊 Interactive CVaR / Monte Carlo Backtest (with Kupiec Test)")
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=bt_df.index,
+                            y=((np.exp(bt_df["Actual_Return"]) - 1) * 100),
+                            mode="lines+markers",
+                            name="Actual Weekly Returns (%)",
+                            hovertemplate="Date: %{x}<br>Actual Return: %{y:.2f}%<extra></extra>",
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=bt_df.index,
+                            y=((np.exp(bt_df["MC_VaR"]) - 1) * 100),
+                            mode="lines",
+                            name="Monte Carlo VaR (%)",
+                            line=dict(color="red", dash="dash"),
+                            hovertemplate="Date: %{x}<br>VaR: %{y:.2f}%<extra></extra>",
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=bt_df.index,
+                            y=((np.exp(bt_df["MC_CVaR"]) - 1) * 100),
+                            mode="lines",
+                            name="Conditional VaR (%)",
+                            line=dict(color="purple", dash="dot"),
+                            hovertemplate="Date: %{x}<br>CVaR: %{y:.2f}%<extra></extra>",
+                        )
+                    )
                     
-                    v_lim = np.percentile(s_r, (1 - conf_level) * 100)
-                    bt_list.append({'Actual': act, 'VaR': v_lim, 'Breach': act < v_lim})
-                
-                bt_df = pd.DataFrame(bt_list)
-                total_b = bt_df['Breach'].sum()
-                lr, p_val = kupiec_test(total_b, len(bt_df), 1 - conf_level)
-                
-                c1, c2 = st.columns(2)
-                c1.metric("Breaches Found", total_b)
-                c2.metric("Kupiec P-Value", f"{p_val:.4f}")
-                
-                if p_val < 0.05: st.error("Model under-estimated tail risk (Rejected).")
-                else: st.success("Model captures volatility accurately (Accepted).")
-            else:
-                st.warning("Insufficient history for rolling backtest.")
+                    fig.update_layout(
+                        title=f"Backtest: Actual vs Monte Carlo VaR/CVaR ({col}) — Kupiec LR={LR_uc:.2f} p={kupiec_pvalue:.3f}",
+                        xaxis_title="Date",
+                        yaxis_title="Weekly Return (%)",
+                        height=450,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # Matplotlib fallback plot
+                    fig, ax = plt.subplots(figsize=(12, 5))
+                    ax.plot(bt_df.index, (np.exp(bt_df["Actual_Return"]) - 1) * 100, label="Actual Returns", alpha=0.7)
+                    ax.plot(bt_df.index, (np.exp(bt_df["MC_VaR"]) - 1) * 100, label="Monte Carlo VaR", color="red", linestyle="--")
+                    ax.plot(bt_df.index, (np.exp(bt_df["MC_CVaR"]) - 1) * 100, label="Conditional CVaR", color="purple", linestyle="-.")
+                    breaches = bt_df[bt_df["Breach_VaR"]]
+                    if not breaches.empty:
+                        ax.scatter(breaches.index, (np.exp(breaches["Actual_Return"]) - 1) * 100, label="VaR Breach")
+                    ax.set_title(f"Backtest: Actual vs Monte Carlo VaR/CVaR ({col}) — Kupiec LR={LR_uc:.2f} p={kupiec_pvalue:.3f}")
+                    ax.set_ylabel("Weekly Return (%)")
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                    st.pyplot(fig)
 
-        with t3:
-            st.subheader("Supply-Adjusted Forecast")
-            if a_col != "None":
-                model_final = sm.OLS(working_df['Log_Returns'], sm.add_constant(working_df['Log_Arrivals'])).fit()
-                f_data = []
-                for w in range(1, 5):
-                    # Simulate arrivals based on current trend
-                    s_arrivals = np.random.normal(working_df['Log_Arrivals'].iloc[-12:].mean(), working_df['Log_Arrivals'].std(), 5000)
-                    s_mu = model_final.params[0] + model_final.params[1] * s_arrivals
-                    s_returns = np.random.normal(s_mu, model_final.resid.std(), 5000)
-                    f_data.append({"Week": w, "VaR Loss (%)": to_pct(np.percentile(s_returns, (1 - conf_level) * 100))})
-                st.dataframe(pd.DataFrame(f_data).round(2), use_container_width=True)
+                # Show Kupiec test summary and other metrics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Observed Breach Rate", f"{(x / n * 100) if n>0 else np.nan:.2f}%")
+                with col2:
+                    st.metric("Expected Breach Rate", f"{(p * 100):.2f}%")
+                with col3:
+                    st.metric("Kupiec p-value", f"{kupiec_pvalue:.3f}" if not np.isnan(kupiec_pvalue) else "N/A")
+
+                if not np.isnan(kupiec_pvalue):
+                    if kupiec_pvalue < 0.05:
+                        st.markdown(
+                            """
+                        <div class="warning-box">
+                            <strong>⚠️ Kupiec Test:</strong> Reject the null: Actual breaches ~ Expected breaches==> "Model is Bad").
+                        </div>
+                        """,
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            """
+                        <div class="success-box">
+                            <strong>✅ Kupiec Test:</strong> Accept the null: Actual breaches ~ Expected breaches==> "Model is best").
+                        </div>
+                        """,
+                            unsafe_allow_html=True,
+                        )
+
+                # Model accuracy metrics (calibration)
+                breach_rate = bt_df["Breach_CVaR"].mean() * 100
+                expected_rate = (1 - confidence_level) * 100
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Model Calibration (approx)", f"{100 - abs(breach_rate - expected_rate):.1f}%")
+                with col2:
+                    st.metric("Actual Breach Rate (CVaR)", f"{breach_rate:.1f}%")
+                with col3:
+                    st.metric("Expected Breach Rate (CVaR)", f"{expected_rate:.1f}%")
+
+                if abs(breach_rate - expected_rate) < 2:
+                    st.markdown(
+                        """
+                    <div class="success-box">
+                        <strong>✅ Model is Working Well!</strong><br>
+                        The breach rate closely matches actual expectation.
+                    </div>
+                    """,
+                        unsafe_allow_html=True,
+                    )
+    
+        # ===================== Future Risk Forecast =====================
+        if run_forecast and "Modal" in df.columns and "Arrivals" in df.columns:
+            st.markdown('<h2 class="sub-header">🔮 Future Risk Forecast</h2>', unsafe_allow_html=True)
+
+            ds = df[["Modal", "Arrivals"]].copy()
+            ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
+            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).fillna(method="bfill")
+            ds = ds.dropna()
+
+            train_latest = ds.iloc[-int(rolling_window) :]
+            model_latest = sm.OLS(train_latest["Log_Returns"], sm.add_constant(train_latest["Log_Arrivals"])).fit()
+
+            mu_arr = train_latest["Log_Arrivals"].mean()
+            sigma_arr = train_latest["Log_Arrivals"].std()
+            resid_sigma = model_latest.resid.std()
+
+            forecast_weeks = list(range(1, int(forecast_horizon) + 1))
+            forecast_cvars = []
+            forecast_vars = []
+
+            for h in forecast_weeks:
+                np.random.seed(42+h)
+                sim_arrivals_future = np.random.normal(mu_arr, sigma_arr, size=int(num_simulations))
+                sim_mu_future = model_latest.params[0] + model_latest.params[1] * sim_arrivals_future
+                sim_returns_future = np.random.normal(sim_mu_future, resid_sigma, size=int(num_simulations))
+
+                var_future = np.percentile(sim_returns_future, (1 - confidence_level) * 100)
+                cvar_future = sim_returns_future[sim_returns_future <= var_future].mean()
+
+                forecast_cvars.append((h, (np.exp(cvar_future) - 1) * 100))
+                forecast_vars.append((h, (np.exp(var_future) - 1) * 100))
+
+            fc_df = pd.DataFrame(forecast_cvars, columns=["Week_Ahead", "Predicted_CVaR (%)"]).set_index("Week_Ahead")
+            var_df = pd.DataFrame(forecast_vars, columns=["Week_Ahead", "Predicted_VaR (%)"]).set_index("Week_Ahead")
+            forecast_df = fc_df.join(var_df)
+
+            worst_idx = fc_df["Predicted_CVaR (%)"].idxmin()
+            worst_val = fc_df["Predicted_CVaR (%)"].min()
+            avg_cvar = fc_df["Predicted_CVaR (%)"].mean()
+            # trend: compare first 5 vs last 5 (guard for short horizons)
+            first_slice = fc_df["Predicted_CVaR (%)"].iloc[: min(5, len(fc_df))]
+            last_slice = fc_df["Predicted_CVaR (%)"].iloc[max(0, len(fc_df) - 5) :]
+            risk_trend = "INCREASING" if last_slice.mean() < first_slice.mean() else "STABLE"
+
+            st.markdown(
+                f"""
+            <div class="info-box">
+                <h4>🎯 Forecast Summary</h4>
+                <p><strong>Worst Risk Period:</strong> Week {worst_idx} ahead with {worst_val:.2f}% potential weekly loss</p>
+                <p><strong>Average Risk:</strong> {avg_cvar:.2f}% weekly loss over next {forecast_horizon} weeks</p>
+                <p><strong>Risk Trend:</strong> {risk_trend} risk levels expected</p>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
+
+            # Plot forecast
+            if interactive_plots and PLOTLY_AVAILABLE:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=forecast_df.index,
+                        y=forecast_df["Predicted_CVaR (%)"],
+                        mode="lines+markers",
+                        name="CVaR Forecast",
+                        line=dict(color="red", width=3),
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=forecast_df.index,
+                        y=forecast_df["Predicted_VaR (%)"],
+                        mode="lines+markers",
+                        name="VaR Forecast",
+                        line=dict(color="orange", width=2),
+                    )
+                )
+                fig.add_vline(x=worst_idx, line=dict(color="red", dash="dash", width=2), annotation_text=f"Highest Risk Week {worst_idx}", annotation_position="top")
+                fig.update_layout(title=f"Risk Forecast for Next {forecast_horizon} Weeks", xaxis_title="Weeks Ahead", yaxis_title="Potential Weekly Loss (%)", height=450)
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Upload Arrivals data for supply-driven forecasts.")
+                fig, ax = plt.subplots(figsize=(12, 5))
+                ax.plot(forecast_df.index, forecast_df["Predicted_CVaR (%)"], marker="o", linewidth=2, label="CVaR Forecast")
+                ax.plot(forecast_df.index, forecast_df["Predicted_VaR (%)"], marker="s", linewidth=2, label="VaR Forecast")
+                ax.axvline(worst_idx, color="red", linestyle="--", alpha=0.7, label=f"Worst Risk (Week {worst_idx})")
+                ax.fill_between(forecast_df.index, forecast_df["Predicted_CVaR (%)"], -20, alpha=0.1, color="red")
+                ax.set_xlabel("Weeks Ahead")
+                ax.set_ylabel("Potential Weekly Loss (%)")
+                ax.set_title(f"Risk Forecast for Next {forecast_horizon} Weeks")
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                st.pyplot(fig)
+
+            # Recommendations based on forecast worst_val
+            if worst_val < -10:
+                recommendation_level = "HIGH ALERT"
+                rec_type = "error"
+            elif worst_val < -5:
+                recommendation_level = "CAUTION"
+                rec_type = "warning"
+            else:
+                recommendation_level = "NORMAL"
+                rec_type = "success"
+
+            if rec_type == "error":
+                st.markdown(
+                    f"""
+                    <div style="background-color: #ffe6e6; padding: 15px; border-radius: 10px; border-left: 5px solid #dc3545;">
+                        <h4>🚨 {recommendation_level}</h4>
+                        <p><strong>High risk detected around week {worst_idx}!</strong></p>
+                        <ul>
+                        </ul>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            elif rec_type == "warning":
+                st.markdown(
+                    f"""
+                    <div style="background-color: #fff3cd; padding: 15px; border-radius: 10px; border-left: 5px solid #ffc107;">
+                        <h4>⚠️ {recommendation_level}</h4>
+                        <p><strong>Moderate risk around week {worst_idx}</strong></p>
+                        <ul>
+                            <li>Monitor market closely around week {worst_idx}</li>
+                            <li>Keep 7-10 days buffer stock</li>
+                            <li>Have backup buyers ready</li>
+                            <li>Save 10% of revenue for emergencies</li>
+                        </ul>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div style="background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745;">
+                        <h4>✅ {recommendation_level}</h4>
+                        <p><strong>Low risk expected - normal operations recommended</strong></p>
+                        <ul>
+                            <li>Standard farming and selling practices should work well</li>
+                            <li>Good time to plan expansion or investments</li>
+                            <li>Maintain normal inventory levels</li>
+                        </ul>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        else:
+            st.markdown(
+                """
+            <div class="info-box">
+                <h4>📊 For Advanced Analysis</h4>
+                <p>To get backtesting and forecasting features, your data should include:</p>
+                <ul>
+                    <li><strong>'Modal'</strong> column (market prices)</li>
+                    <li><strong>'Arrivals'</strong> column (quantities/volumes)</li>
+                </ul>
+                <p>Basic per-column risk metrics are still computed above.</p>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
     except Exception as e:
-        st.error(f"Computation Error: {e}")
+        st.error(f"❌ Error processing file: {str(e)}")
+        st.info("💡 Make sure your file has a 'Date' column (or datetime index) and at least one numeric price column")
+
 else:
-    st.markdown("""
-    ### 📂 Ready to Analyze
-    Please upload your **Tomato Market Data** to begin the automated VaR analysis.
-    The app will automatically calculate:
-    * **Downside Risk** across 4 methodologies.
-    * **Kupiec POF test** for PhD-level validation.
-    * **CVaR (Expected Shortfall)** for tail-risk analysis.
-    """)
+    # Sample data section
+    st.markdown(
+        """
+    <div class="info-box">
+        <h4>🎯 Don't have data? Try our sample!</h4>
+        <p>Click the button below to see how the app works with sample tomato market data.</p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("📊 Load Sample Data", type="primary"):
+        np.random.seed(42)
+        dates = pd.date_range(start="2022-01-01", end="2024-12-31", freq="W")
+        base_price = 50
+        seasonal_factor = 10 * np.sin(2 * np.pi * np.arange(len(dates)) / 52)
+        trend = 0.1 * np.arange(len(dates))
+        noise = np.random.normal(0, 5, len(dates))
+        modal_prices = base_price + seasonal_factor + trend + noise
+        modal_prices = np.maximum(modal_prices, 20)
+        base_arrivals = 1000
+        arrivals_seasonal = -200 * np.sin(2 * np.pi * np.arange(len(dates)) / 52 + np.pi / 4)
+        arrivals_noise = np.random.normal(0, 100, len(dates))
+        arrivals = base_arrivals + arrivals_seasonal + arrivals_noise
+        arrivals = np.maximum(arrivals, 100)
+        sample_df = pd.DataFrame(
+            {
+                "Date": dates,
+                "Modal": modal_prices,
+                "Arrivals": arrivals,
+                "Wholesale": modal_prices * 0.8,
+                "Retail": modal_prices * 1.3,
+            }
+        )
+        st.success("✅ Sample tomato market data loaded!")
+        st.dataframe(sample_df.head(10))
+        st.download_button("📥 Download Sample Data", sample_df.to_csv(index=False), "sample_market_data.csv", "text/csv")
+
+# Footer
+st.markdown("---")
+st.markdown(
+    f"""
+<div style="text-align: center; padding: 20px; background-color: #f8f9fa; border-radius: 10px; margin-top: 30px;">
+    <h4 style="color: #2E8B57; margin-bottom: 10px;">🌾 Built for Farmers, By Young Economist</h4>
+    <p style="color: #666; margin-bottom: 15px;">
+        This app helps you understand market risks and make better farming decisions.<br>
+        For questions or support, contact us below.
+    </p>
+    <div style="display: flex; justify-content: center; gap: 30px; flex-wrap: wrap;">
+        <div><strong>📧 Email:</strong> sumanecon.uas@outlook.in</div>
+        <div><strong>👨‍💼 Developer:</strong> Suman L</div>
+        <div><strong>🎓 University:</strong> UAS Bengaluru</div>
+    </div>
+    <p style="font-size: 12px; color: #999; margin-top: 15px;">
+        Version 2.1 | Enhanced for Professional Use | Updated {pd.Timestamp.now().strftime("%B %Y")}
+    </p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
