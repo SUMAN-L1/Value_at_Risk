@@ -610,7 +610,7 @@ else:
     # Prepare advanced dataset
     ds = df[["Modal","Arrivals"]].copy()
     ds["Log_Returns"]  = np.log(ds["Modal"] / ds["Modal"].shift(1))
-    ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).ffill().bfill()
+    ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).bfill().ffill()
     ds = ds.dropna()
 
     # ── OLS Regression ──
