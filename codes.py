@@ -378,7 +378,8 @@ if uploaded_file:
 
             ds = df[["Modal", "Arrivals"]].copy()
             ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
-            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).fillna(method="bfill")
+            # FIX: replaced fillna(method="bfill") with .bfill() for pandas compatibility
+            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).bfill()
             ds = ds.dropna()
 
             if len(ds) > rolling_window:
@@ -558,7 +559,8 @@ if uploaded_file:
 
             ds = df[["Modal", "Arrivals"]].copy()
             ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
-            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).fillna(method="bfill")
+            # FIX: replaced fillna(method="bfill") with .bfill() for pandas compatibility
+            ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).bfill()
             ds = ds.dropna()
 
             train_latest = ds.iloc[-int(rolling_window) :]
