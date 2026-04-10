@@ -2,7 +2,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import norm, chi2
@@ -11,6 +10,36 @@ import warnings
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
+
+# ===================== Pandas compatibility patch =====================
+# Pandas 2.x removed fillna(method=...). This patch restores it so that
+# older libraries (e.g. statsmodels) that still call fillna(method='bfill')
+# continue to work without errors.
+_orig_df_fillna = pd.DataFrame.fillna
+_orig_series_fillna = pd.Series.fillna
+
+def _compat_fillna(self, value=None, method=None, axis=None,
+                   inplace=False, limit=None, **kwargs):
+    if method is not None:
+        m = method.lower()
+        if m in ("bfill", "backfill"):
+            result = self.bfill(axis=axis, inplace=inplace, limit=limit)
+        elif m in ("ffill", "pad"):
+            result = self.ffill(axis=axis, inplace=inplace, limit=limit)
+        else:
+            raise ValueError(f"Unknown fillna method: {method!r}")
+        return result
+    if isinstance(self, pd.DataFrame):
+        return _orig_df_fillna(self, value=value, axis=axis,
+                               inplace=inplace, limit=limit, **kwargs)
+    return _orig_series_fillna(self, value=value, axis=axis,
+                               inplace=inplace, limit=limit, **kwargs)
+
+pd.DataFrame.fillna = _compat_fillna
+pd.Series.fillna = _compat_fillna
+# =====================================================================
+
+import statsmodels.api as sm
 
 # Try import plotly for interactive charts
 try:
@@ -70,7 +99,6 @@ with st.expander("📋 How to Use This App (Click to Read)", expanded=False):
 # ===================== Sidebar Controls =====================
 st.sidebar.markdown('<h2 style="color: #2E8B57;">⚙️ Settings</h2>', unsafe_allow_html=True)
 
-# Confidence level as integer percent (clear UX)
 st.sidebar.markdown("**📊 Confidence Level (VaR)**")
 conf_percent = st.sidebar.slider(
     "Choose confidence level (percent)",
@@ -83,7 +111,6 @@ conf_percent = st.sidebar.slider(
 confidence_level = conf_percent / 100.0
 z_score = norm.ppf(1 - confidence_level)
 
-# Monte Carlo simulations
 st.sidebar.markdown("**🎲 Number of Simulations**")
 num_simulations = st.sidebar.number_input(
     "More simulations = more accurate (but slower)",
@@ -94,7 +121,6 @@ num_simulations = st.sidebar.number_input(
     help="Default 10,000 is good for most cases",
 )
 
-# Rolling window for backtesting
 st.sidebar.markdown("**📅 Analysis Window (weeks)**")
 rolling_window = st.sidebar.number_input(
     "Weeks of data to use for each prediction",
@@ -105,7 +131,6 @@ rolling_window = st.sidebar.number_input(
     help="52 weeks = 1 year of data for each prediction",
 )
 
-# Forecast horizon
 st.sidebar.markdown("**🔮 Forecast Horizon (weeks)**")
 forecast_horizon = st.sidebar.number_input(
     "How many weeks ahead to predict",
@@ -116,7 +141,6 @@ forecast_horizon = st.sidebar.number_input(
     help="26 weeks = 6 months ahead prediction",
 )
 
-# Options
 st.sidebar.markdown("---")
 st.sidebar.markdown("**📈 Display Options**")
 run_forecast = st.sidebar.checkbox("Show future risk forecast", value=True)
@@ -147,13 +171,11 @@ def read_file(uploaded):
         return pd.read_excel(uploaded)
 
 def prepare_index_dates(df):
-    # try common date column names
     for c in ["Date", "date", "DATE"]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
             df = df.dropna(subset=[c]).set_index(c).sort_index()
             return df
-    # if index looks like dates already
     try:
         df.index = pd.to_datetime(df.index)
     except Exception:
@@ -176,7 +198,6 @@ if uploaded_file:
             unsafe_allow_html=True,
         )
 
-        # numeric columns
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
         if not numeric_cols:
             st.error("❌ No numeric price columns found in your data!")
@@ -186,12 +207,10 @@ if uploaded_file:
         with col1:
             selected_col = st.selectbox("🎯 Select Market Price Column", options=["All Columns"] + numeric_cols, help="Choose which price to analyze for risk")
         with col2:
-            # date range picker
             default_start = df.index.min().date()
             default_end = df.index.max().date()
             date_range = st.date_input("📅 Select Date Range", [default_start, default_end])
 
-        # filter by date range
         if len(date_range) == 2:
             start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
             df = df.loc[(df.index >= start) & (df.index <= end)]
@@ -210,23 +229,17 @@ if uploaded_file:
                 st.warning(f"⚠️ Not enough data for {col}. Need at least 30 data points.")
                 continue
 
-            # log returns
             log_returns = np.log(series / series.shift(1)).dropna()
             mu, sigma = log_returns.mean(), log_returns.std()
 
-            # Historical VaR: empirical quantile of returns
             hist_var = np.percentile(log_returns, (1 - confidence_level) * 100)
-
-            # Parametric VaR: assume normal with mu, sigma
             param_var = mu + z_score * sigma
 
-            # Monte Carlo simulations and CVaR
             np.random.seed(42)
             sim_returns = np.random.normal(mu, sigma, size=int(num_simulations))
             mc_var = np.percentile(sim_returns, (1 - confidence_level) * 100)
             mc_cvar = sim_returns[sim_returns <= mc_var].mean()
 
-            # convert to percent (weekly loss % approx)
             def to_pct(x):
                 return (np.exp(x) - 1) * 100
 
@@ -240,7 +253,6 @@ if uploaded_file:
                 }
             )
 
-            # Policy brief (simple)
             risk_level = "HIGH" if abs(mc_cvar) > 0.1 else "MODERATE" if abs(mc_cvar) > 0.05 else "LOW"
             brief_template = Template(
                 """
@@ -299,57 +311,30 @@ if uploaded_file:
             )
             briefs.append((col, brief))
 
-            # ====== Plot: combined view (Historical distribution + parametric + MC VaR + CVaR) ======
             if interactive_plots and PLOTLY_AVAILABLE:
                 fig = go.Figure()
-
-                # Histogram of historical log-returns
-                fig.add_trace(
-                    go.Histogram(
-                        x=log_returns,
-                        nbinsx=50,
-                        name="Historical (Empirical)",
-                        opacity=0.6,
-                    )
-                )
-
-                # Parametric normal density (scaled) as a line with method legend label
+                fig.add_trace(go.Histogram(x=log_returns, nbinsx=50, name="Historical (Empirical)", opacity=0.6))
                 xs = np.linspace(log_returns.min(), log_returns.max(), 200)
                 pdf_vals = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
-                # scale pdf to histogram height approximately
                 scale_factor = len(log_returns) * (log_returns.max() - log_returns.min()) / 50
                 fig.add_trace(go.Scatter(x=xs, y=pdf_vals * scale_factor, mode="lines", name="Parametric (Normal)"))
-
-                # Vertical lines for VaRs & CVaR with meaningful legend names
                 fig.add_vline(x=hist_var, line=dict(color="black", dash="dash"))
                 fig.add_vline(x=param_var, line=dict(color="green", dash="dash"))
                 fig.add_vline(x=mc_var, line=dict(color="red", dash="dash"))
                 fig.add_vline(x=mc_cvar, line=dict(color="purple", dash="dash"), annotation_text=f"Conditional CVaR {to_pct(mc_cvar):.2f}%", annotation_position="top left")
-                              
-                # To show methods in legend explicitly, add invisible scatter traces with method names (helps legend clarity)
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="black"), name="Historical VaR"))
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="green"), name="Parametric VaR"))
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="red"), name="Monte Carlo VaR"))
                 fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="purple"), name="Conditional VaR"))
-
-                fig.update_layout(
-                    title=f"Risk Distribution & Methods - {col}",
-                    xaxis_title="Log Returns",
-                    yaxis_title="Frequency / scaled density",
-                    bargap=0.1,
-                    height=450,
-                    showlegend=True,
-                )
+                fig.update_layout(title=f"Risk Distribution & Methods - {col}", xaxis_title="Log Returns", yaxis_title="Frequency / scaled density", bargap=0.1, height=450, showlegend=True)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                # Matplotlib fallback: label methods clearly in legend
                 fig, ax = plt.subplots(figsize=(10, 4))
                 sns.histplot(log_returns, bins=50, kde=False, ax=ax)
                 xs = np.linspace(log_returns.min(), log_returns.max(), 200)
                 pdf_vals = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mu) / sigma) ** 2)
                 scale_factor = len(log_returns) * (log_returns.max() - log_returns.min()) / 50
                 ax.plot(xs, pdf_vals * scale_factor, linestyle="--", label="Parametric (Normal)")
-                # VaR lines
                 ax.axvline(hist_var, color="black", linestyle="--", label=f"Historical VaR {to_pct(hist_var):.2f}%")
                 ax.axvline(param_var, color="green", linestyle="--", label=f"Parametric VaR {to_pct(param_var):.2f}%")
                 ax.axvline(mc_var, color="red", linestyle="--", label=f"Monte Carlo VaR {to_pct(mc_var):.2f}%")
@@ -359,13 +344,11 @@ if uploaded_file:
                 ax.legend()
                 st.pyplot(fig)
 
-        # Display results table
         if results:
             st.markdown("### 📋 Risk Comparison Table")
             results_df = pd.DataFrame(results).set_index("Market")
             st.dataframe(results_df, use_container_width=True)
 
-        # Display policy briefs
         if briefs:
             st.markdown("### 📝 Detailed Risk Analysis & Recommendations")
             for market, brief in briefs:
@@ -378,7 +361,6 @@ if uploaded_file:
 
             ds = df[["Modal", "Arrivals"]].copy()
             ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
-            # FIX: replaced fillna(method="bfill") with .bfill() for pandas compatibility
             ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).bfill()
             ds = ds.dropna()
 
@@ -393,7 +375,6 @@ if uploaded_file:
                     y = train["Log_Returns"]
                     model = sm.OLS(y, X).fit()
 
-                    # simulate arrivals and returns
                     sim_arr = np.random.normal(train["Log_Arrivals"].mean(), train["Log_Arrivals"].std(), int(num_simulations))
                     sim_mu = model.params[0] + model.params[1] * sim_arr
                     sim_ret = np.random.normal(sim_mu, model.resid.std(), size=int(num_simulations))
@@ -415,79 +396,33 @@ if uploaded_file:
 
                 bt_df = pd.DataFrame(backtest_results).set_index("Date")
 
-                # -------------------------
-                # Kupiec (Unconditional Coverage) test for VaR breaches
-                # x = observed failures, n = sample size, p = expected failure prob = 1 - confidence_level
-                # LR_uc = -2 * ( log((1-p)^(n-x) p^x) - log((1-p_hat)^(n-x) p_hat^x) )
-                # p-value = 1 - chi2.cdf(LR_uc, df=1)
-                # -------------------------
                 n = len(bt_df)
                 x = bt_df["Breach_VaR"].sum()
                 p = 1 - confidence_level
                 p_hat = x / n if n > 0 else 0.0
 
-                # Guard against zero/one probabilities
                 def safe_log(x):
                     return np.log(x) if x > 0 else -1e10
 
                 if n > 0:
-                    # Log-likelihood under H0 (p)
                     ll0 = (n - x) * safe_log(1 - p) + x * safe_log(p)
-                    # Log-likelihood under H1 (p_hat)
-                    # If p_hat is 0 or 1, adjust slightly to avoid -inf
                     ph = min(max(p_hat, 1e-10), 1 - 1e-10)
                     ll1 = (n - x) * safe_log(1 - ph) + x * safe_log(ph)
-
                     LR_uc = -2 * (ll0 - ll1)
                     kupiec_pvalue = 1 - chi2.cdf(LR_uc, df=1)
                 else:
                     LR_uc = np.nan
                     kupiec_pvalue = np.nan
 
-                # Interactive CVaR / Monte Carlo backtest plot with breaches highlighted
                 if interactive_plots and PLOTLY_AVAILABLE:
                     st.markdown("### 📊 Interactive CVaR / Monte Carlo Backtest (with Kupiec Test)")
                     fig = go.Figure()
-                    fig.add_trace(
-                        go.Scatter(
-                            x=bt_df.index,
-                            y=((np.exp(bt_df["Actual_Return"]) - 1) * 100),
-                            mode="lines+markers",
-                            name="Actual Weekly Returns (%)",
-                            hovertemplate="Date: %{x}<br>Actual Return: %{y:.2f}%<extra></extra>",
-                        )
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=bt_df.index,
-                            y=((np.exp(bt_df["MC_VaR"]) - 1) * 100),
-                            mode="lines",
-                            name="Monte Carlo VaR (%)",
-                            line=dict(color="red", dash="dash"),
-                            hovertemplate="Date: %{x}<br>VaR: %{y:.2f}%<extra></extra>",
-                        )
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=bt_df.index,
-                            y=((np.exp(bt_df["MC_CVaR"]) - 1) * 100),
-                            mode="lines",
-                            name="Conditional VaR (%)",
-                            line=dict(color="purple", dash="dot"),
-                            hovertemplate="Date: %{x}<br>CVaR: %{y:.2f}%<extra></extra>",
-                        )
-                    )
-                    
-                    fig.update_layout(
-                        title=f"Backtest: Actual vs Monte Carlo VaR/CVaR ({col}) — Kupiec LR={LR_uc:.2f} p={kupiec_pvalue:.3f}",
-                        xaxis_title="Date",
-                        yaxis_title="Weekly Return (%)",
-                        height=450,
-                        hovermode="x unified",
-                    )
+                    fig.add_trace(go.Scatter(x=bt_df.index, y=((np.exp(bt_df["Actual_Return"]) - 1) * 100), mode="lines+markers", name="Actual Weekly Returns (%)", hovertemplate="Date: %{x}<br>Actual Return: %{y:.2f}%<extra></extra>"))
+                    fig.add_trace(go.Scatter(x=bt_df.index, y=((np.exp(bt_df["MC_VaR"]) - 1) * 100), mode="lines", name="Monte Carlo VaR (%)", line=dict(color="red", dash="dash"), hovertemplate="Date: %{x}<br>VaR: %{y:.2f}%<extra></extra>"))
+                    fig.add_trace(go.Scatter(x=bt_df.index, y=((np.exp(bt_df["MC_CVaR"]) - 1) * 100), mode="lines", name="Conditional VaR (%)", line=dict(color="purple", dash="dot"), hovertemplate="Date: %{x}<br>CVaR: %{y:.2f}%<extra></extra>"))
+                    fig.update_layout(title=f"Backtest: Actual vs Monte Carlo VaR/CVaR ({col}) — Kupiec LR={LR_uc:.2f} p={kupiec_pvalue:.3f}", xaxis_title="Date", yaxis_title="Weekly Return (%)", height=450, hovermode="x unified")
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Matplotlib fallback plot
                     fig, ax = plt.subplots(figsize=(12, 5))
                     ax.plot(bt_df.index, (np.exp(bt_df["Actual_Return"]) - 1) * 100, label="Actual Returns", alpha=0.7)
                     ax.plot(bt_df.index, (np.exp(bt_df["MC_VaR"]) - 1) * 100, label="Monte Carlo VaR", color="red", linestyle="--")
@@ -501,7 +436,6 @@ if uploaded_file:
                     ax.grid(True, alpha=0.3)
                     st.pyplot(fig)
 
-                # Show Kupiec test summary and other metrics
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Observed Breach Rate", f"{(x / n * 100) if n>0 else np.nan:.2f}%")
@@ -512,25 +446,10 @@ if uploaded_file:
 
                 if not np.isnan(kupiec_pvalue):
                     if kupiec_pvalue < 0.05:
-                        st.markdown(
-                            """
-                        <div class="warning-box">
-                            <strong>⚠️ Kupiec Test:</strong> Reject the null: Actual breaches ~ Expected breaches==> "Model is Bad").
-                        </div>
-                        """,
-                            unsafe_allow_html=True,
-                        )
+                        st.markdown('<div class="warning-box"><strong>⚠️ Kupiec Test:</strong> Reject the null: Actual breaches ~ Expected breaches==> "Model is Bad").</div>', unsafe_allow_html=True)
                     else:
-                        st.markdown(
-                            """
-                        <div class="success-box">
-                            <strong>✅ Kupiec Test:</strong> Accept the null: Actual breaches ~ Expected breaches==> "Model is best").
-                        </div>
-                        """,
-                            unsafe_allow_html=True,
-                        )
+                        st.markdown('<div class="success-box"><strong>✅ Kupiec Test:</strong> Accept the null: Actual breaches ~ Expected breaches==> "Model is best").</div>', unsafe_allow_html=True)
 
-                # Model accuracy metrics (calibration)
                 breach_rate = bt_df["Breach_CVaR"].mean() * 100
                 expected_rate = (1 - confidence_level) * 100
 
@@ -543,27 +462,18 @@ if uploaded_file:
                     st.metric("Expected Breach Rate (CVaR)", f"{expected_rate:.1f}%")
 
                 if abs(breach_rate - expected_rate) < 2:
-                    st.markdown(
-                        """
-                    <div class="success-box">
-                        <strong>✅ Model is Working Well!</strong><br>
-                        The breach rate closely matches actual expectation.
-                    </div>
-                    """,
-                        unsafe_allow_html=True,
-                    )
-    
+                    st.markdown('<div class="success-box"><strong>✅ Model is Working Well!</strong><br>The breach rate closely matches actual expectation.</div>', unsafe_allow_html=True)
+
         # ===================== Future Risk Forecast =====================
         if run_forecast and "Modal" in df.columns and "Arrivals" in df.columns:
             st.markdown('<h2 class="sub-header">🔮 Future Risk Forecast</h2>', unsafe_allow_html=True)
 
             ds = df[["Modal", "Arrivals"]].copy()
             ds["Log_Returns"] = np.log(ds["Modal"] / ds["Modal"].shift(1))
-            # FIX: replaced fillna(method="bfill") with .bfill() for pandas compatibility
             ds["Log_Arrivals"] = np.log(ds["Arrivals"].replace(0, np.nan)).bfill()
             ds = ds.dropna()
 
-            train_latest = ds.iloc[-int(rolling_window) :]
+            train_latest = ds.iloc[-int(rolling_window):]
             model_latest = sm.OLS(train_latest["Log_Returns"], sm.add_constant(train_latest["Log_Arrivals"])).fit()
 
             mu_arr = train_latest["Log_Arrivals"].mean()
@@ -575,14 +485,12 @@ if uploaded_file:
             forecast_vars = []
 
             for h in forecast_weeks:
-                np.random.seed(42+h)
+                np.random.seed(42 + h)
                 sim_arrivals_future = np.random.normal(mu_arr, sigma_arr, size=int(num_simulations))
                 sim_mu_future = model_latest.params[0] + model_latest.params[1] * sim_arrivals_future
                 sim_returns_future = np.random.normal(sim_mu_future, resid_sigma, size=int(num_simulations))
-
                 var_future = np.percentile(sim_returns_future, (1 - confidence_level) * 100)
                 cvar_future = sim_returns_future[sim_returns_future <= var_future].mean()
-
                 forecast_cvars.append((h, (np.exp(cvar_future) - 1) * 100))
                 forecast_vars.append((h, (np.exp(var_future) - 1) * 100))
 
@@ -593,9 +501,8 @@ if uploaded_file:
             worst_idx = fc_df["Predicted_CVaR (%)"].idxmin()
             worst_val = fc_df["Predicted_CVaR (%)"].min()
             avg_cvar = fc_df["Predicted_CVaR (%)"].mean()
-            # trend: compare first 5 vs last 5 (guard for short horizons)
             first_slice = fc_df["Predicted_CVaR (%)"].iloc[: min(5, len(fc_df))]
-            last_slice = fc_df["Predicted_CVaR (%)"].iloc[max(0, len(fc_df) - 5) :]
+            last_slice = fc_df["Predicted_CVaR (%)"].iloc[max(0, len(fc_df) - 5):]
             risk_trend = "INCREASING" if last_slice.mean() < first_slice.mean() else "STABLE"
 
             st.markdown(
@@ -610,27 +517,10 @@ if uploaded_file:
                 unsafe_allow_html=True,
             )
 
-            # Plot forecast
             if interactive_plots and PLOTLY_AVAILABLE:
                 fig = go.Figure()
-                fig.add_trace(
-                    go.Scatter(
-                        x=forecast_df.index,
-                        y=forecast_df["Predicted_CVaR (%)"],
-                        mode="lines+markers",
-                        name="CVaR Forecast",
-                        line=dict(color="red", width=3),
-                    )
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=forecast_df.index,
-                        y=forecast_df["Predicted_VaR (%)"],
-                        mode="lines+markers",
-                        name="VaR Forecast",
-                        line=dict(color="orange", width=2),
-                    )
-                )
+                fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df["Predicted_CVaR (%)"], mode="lines+markers", name="CVaR Forecast", line=dict(color="red", width=3)))
+                fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df["Predicted_VaR (%)"], mode="lines+markers", name="VaR Forecast", line=dict(color="orange", width=2)))
                 fig.add_vline(x=worst_idx, line=dict(color="red", dash="dash", width=2), annotation_text=f"Highest Risk Week {worst_idx}", annotation_position="top")
                 fig.update_layout(title=f"Risk Forecast for Next {forecast_horizon} Weeks", xaxis_title="Weeks Ahead", yaxis_title="Potential Weekly Loss (%)", height=450)
                 st.plotly_chart(fig, use_container_width=True)
@@ -647,7 +537,6 @@ if uploaded_file:
                 ax.grid(True, alpha=0.3)
                 st.pyplot(fig)
 
-            # Recommendations based on forecast worst_val
             if worst_val < -10:
                 recommendation_level = "HIGH ALERT"
                 rec_type = "error"
@@ -659,48 +548,11 @@ if uploaded_file:
                 rec_type = "success"
 
             if rec_type == "error":
-                st.markdown(
-                    f"""
-                    <div style="background-color: #ffe6e6; padding: 15px; border-radius: 10px; border-left: 5px solid #dc3545;">
-                        <h4>🚨 {recommendation_level}</h4>
-                        <p><strong>High risk detected around week {worst_idx}!</strong></p>
-                        <ul>
-                        </ul>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div style="background-color: #ffe6e6; padding: 15px; border-radius: 10px; border-left: 5px solid #dc3545;"><h4>🚨 {recommendation_level}</h4><p><strong>High risk detected around week {worst_idx}!</strong></p></div>', unsafe_allow_html=True)
             elif rec_type == "warning":
-                st.markdown(
-                    f"""
-                    <div style="background-color: #fff3cd; padding: 15px; border-radius: 10px; border-left: 5px solid #ffc107;">
-                        <h4>⚠️ {recommendation_level}</h4>
-                        <p><strong>Moderate risk around week {worst_idx}</strong></p>
-                        <ul>
-                            <li>Monitor market closely around week {worst_idx}</li>
-                            <li>Keep 7-10 days buffer stock</li>
-                            <li>Have backup buyers ready</li>
-                            <li>Save 10% of revenue for emergencies</li>
-                        </ul>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div style="background-color: #fff3cd; padding: 15px; border-radius: 10px; border-left: 5px solid #ffc107;"><h4>⚠️ {recommendation_level}</h4><p><strong>Moderate risk around week {worst_idx}</strong></p><ul><li>Monitor market closely around week {worst_idx}</li><li>Keep 7-10 days buffer stock</li><li>Have backup buyers ready</li><li>Save 10% of revenue for emergencies</li></ul></div>', unsafe_allow_html=True)
             else:
-                st.markdown(
-                    f"""
-                    <div style="background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745;">
-                        <h4>✅ {recommendation_level}</h4>
-                        <p><strong>Low risk expected - normal operations recommended</strong></p>
-                        <ul>
-                            <li>Standard farming and selling practices should work well</li>
-                            <li>Good time to plan expansion or investments</li>
-                            <li>Maintain normal inventory levels</li>
-                        </ul>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div style="background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745;"><h4>✅ {recommendation_level}</h4><p><strong>Low risk expected - normal operations recommended</strong></p><ul><li>Standard farming and selling practices should work well</li><li>Good time to plan expansion or investments</li><li>Maintain normal inventory levels</li></ul></div>', unsafe_allow_html=True)
 
         else:
             st.markdown(
@@ -723,7 +575,6 @@ if uploaded_file:
         st.info("💡 Make sure your file has a 'Date' column (or datetime index) and at least one numeric price column")
 
 else:
-    # Sample data section
     st.markdown(
         """
     <div class="info-box">
